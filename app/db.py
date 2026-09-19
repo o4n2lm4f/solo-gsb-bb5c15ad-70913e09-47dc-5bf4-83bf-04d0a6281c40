@@ -17,6 +17,22 @@ CREATE TABLE IF NOT EXISTS rate_versions (
     reason        TEXT                    -- 录入/修订说明
 );
 CREATE INDEX IF NOT EXISTS idx_rate_versions_contract ON rate_versions (contract_no);
+
+-- 版本血缘边：方向为新版本 → 旧版本（祖先方向）。
+--   supersedes    ：新费率 → 本次修订被它取代的每个旧版本；
+--   retained_from ：补偿片段 → 其费率/区间所来源的旧版本。
+-- 一次录入（含补偿片段）产生的全部边与版本行在同一事务写入；
+-- 没有出边的版本（含全部历史行）视为血缘根。
+CREATE TABLE IF NOT EXISTS rate_version_edges (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    from_rate_id INTEGER NOT NULL,        -- 新版本（后代）
+    to_rate_id   INTEGER NOT NULL,        -- 指向的旧版本（祖先）
+    relation    TEXT NOT NULL,            -- supersedes / retained_from
+    created_at  TEXT NOT NULL,            -- 边建立时间（= 修订 recorded_at，UTC ISO）
+    UNIQUE (from_rate_id, to_rate_id, relation)
+);
+CREATE INDEX IF NOT EXISTS idx_rve_from ON rate_version_edges (from_rate_id);
+CREATE INDEX IF NOT EXISTS idx_rve_to ON rate_version_edges (to_rate_id);
 """
 
 

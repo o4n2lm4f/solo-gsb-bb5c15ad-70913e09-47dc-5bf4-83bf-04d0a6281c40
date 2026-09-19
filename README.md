@@ -47,6 +47,19 @@ docker compose up --build
 取代标记、新版本与补偿版本在**同一事务**提交：先创建新费率（取得最小的新
 版本号），补偿片段再按 `valid_from` 排序紧随其后，`version` 严格递增。
 
+**可审计血缘（v1.4 起）**：每次修订在同一事务写入血缘边表
+`rate_version_edges`，边的方向统一为**新版本 → 旧版本（祖先方向）**：
+
+| 边 `relation` | 起点 | 终点 |
+|---|---|---|
+| `supersedes` | 本次新费率 | 本次被取代的**每一个**旧版本 |
+| `retained_from` | 每个补偿片段 | 该片段费率/区间所来源的旧版本 |
+
+因此一次部分重叠修订会写入 1..N 条 `supersedes` 边（每个被取代版本一条）
+以及与补偿片段等量的 `retained_from` 边；没有任何出边的版本（包括边表建立
+之前写入的全部历史行）在血缘中视为**根**。边只追加、永不改写，与版本行
+一起同事务提交（任一步失败整体回滚）。
+
 ## 接口
 
 ### 1. 录入 / 修订费率 — `POST /rates`
@@ -293,6 +306,61 @@ curl "http://localhost:8000/contracts/HT-2026-001/changes?from=2026-01-01T00:00:
 }
 ```
 
+### 7. 版本血缘 — `GET /rates/{rate_id}/lineage`
+
+```bash
+curl http://localhost:8000/rates/2/lineage
+```
+
+从目标版本出发，沿 `supersedes` / `retained_from` 边向**全部祖先**展开，
+返回去重后的有向无环图（DAG）：
+
+- `nodes`：目标版本及全部可达祖先。每个节点包含版本时间线中版本对象的
+  **全部现有字段**（`rate_id` / `contract_no` / `rate` / `version` /
+  `valid_from` / `valid_to` / `recorded_at` / `superseded_at` / `status` /
+  `reason`），另附 `distance`——到目标版本的最短边数（目标为 0，每越过
+  一条血缘边 +1）。节点按 **距离目标从近到远**排序，同距离按 `version`
+  升序、再按 `rate_id` 升序，保证顺序稳定。
+- `edges`：展开范围内的全部血缘边（自动去重），每条边含
+  `from_rate_id` / `to_rate_id` / `relation` / `created_at`（边建立时间
+  = 修订的 `recorded_at`）。边按起点节点距离、`from_rate_id`、
+  `relation`、`to_rate_id` 排序。
+
+历史行没有任何出边时视为根：其血缘只含自身一个节点、边列表为空。
+注意边是新版本指向旧版本的，故从旧版本展开不会包含取代它的新版本。
+
+| 情形 | 状态码 | `code` |
+|---|---|---|
+| 展开成功（含只有根节点） | 200 | — |
+| `rate_id` 不存在 | 404 | `RATE_NOT_FOUND` |
+| 血缘中存在环或悬空边 | 409 | `LINEAGE_CORRUPT` |
+
+展开使用显式栈的迭代式遍历（非递归），并做灰/黑环检测与悬空端点校验，
+发现损坏立即返回 409，**不会无限递归或挂死**。
+
+响应示例（全年 0.05 的 v1 被 4–6 月的 v2 部分修订，v2 取代 v1，
+左补偿 v3 / 右补偿 v4 各保留 v1 的来源血缘；从 v2 展开）：
+
+```json
+{
+  "target_rate_id": 2,
+  "nodes": [
+    {"rate_id": 2, "rate": 0.09, "version": 2, "status": "current",
+     "distance": 0, "...": "..."},
+    {"rate_id": 1, "rate": 0.05, "version": 1, "status": "superseded",
+     "distance": 1, "...": "..."}
+  ],
+  "edges": [
+    {"from_rate_id": 2, "to_rate_id": 1, "relation": "supersedes",
+     "created_at": "2026-03-01T00:00:00.000000+00:00"}
+  ]
+}
+```
+
+从左补偿片段 `GET /rates/3/lineage` 展开则得到
+`3 →(retained_from) 1`；多次窗口修订可经 `retained_from` 链逐级追溯到
+最初版本（菱形汇合时同一祖先只出现一次，`distance` 取最短边数）。
+
 ## 本地开发（不用 Docker）
 
 ```bash
@@ -307,8 +375,8 @@ pytest                 # 运行测试
 ```
 app/
   main.py      FastAPI 路由与请求/响应模型
-  logic.py     双时态核心逻辑（追加式录入、时点查询、时间线、覆盖率分段、计费预览、变更对比）
-  db.py        SQLite 连接与自动建表
+  logic.py     双时态核心逻辑（追加式录入、时点查询、时间线、覆盖率分段、计费预览、变更对比、版本血缘展开）
+  db.py        SQLite 连接与自动建表（rate_versions + rate_version_edges）
   timeutil.py  UTC 时间规范化（等宽 ISO 字符串，可字典序比较）
 tests/test_api.py
 Dockerfile / docker-compose.yml

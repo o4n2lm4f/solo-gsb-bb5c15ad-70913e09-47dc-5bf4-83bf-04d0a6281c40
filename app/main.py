@@ -24,7 +24,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="合同费率双时态追溯 API",
-    version="1.3.0",
+    version="1.4.0",
     description="按业务时间（valid_at）与认知时间（known_at）双维度追溯合同费率，修订只追加版本、不覆盖历史。",
     lifespan=lifespan,
 )
@@ -184,6 +184,27 @@ class ChargePreviewResponse(BaseModel):
     lines: list[ChargeLineView]
 
 
+class LineageNode(VersionView):
+    distance: int = Field(description="到目标版本的最短边数：目标为 0，每越过一条血缘边 +1")
+
+
+class LineageEdge(BaseModel):
+    from_rate_id: int = Field(description="边的起点：新版本（后代）")
+    to_rate_id: int = Field(description="边的终点：旧版本（祖先）")
+    relation: str = Field(description="supersedes（修订取代）/ retained_from（补偿片段来源）")
+    created_at: str = Field(description="边建立时间（= 修订 recorded_at）")
+
+
+class LineageResponse(BaseModel):
+    target_rate_id: int
+    nodes: list[LineageNode] = Field(
+        description="目标及全部可达祖先（去重），按 distance 升序、同距离按 version 升序、再按 rate_id 升序"
+    )
+    edges: list[LineageEdge] = Field(
+        description="展开范围内的全部血缘边（去重），按源节点 distance、from_rate_id、relation、to_rate_id 排序"
+    )
+
+
 def to_view(row: sqlite3.Row) -> VersionView:
     return VersionView(
         rate_id=row["id"],
@@ -291,6 +312,33 @@ def timeline(contract_no: str):
             detail={"code": "CONTRACT_NOT_FOUND", "message": f"合同 '{contract_no}' 无任何费率版本"},
         )
     return TimelineResponse(contract_no=contract_no, versions=[to_view(r) for r in rows])
+
+
+@app.get("/rates/{rate_id}/lineage", response_model=LineageResponse)
+def rate_lineage(rate_id: int):
+    """版本血缘：从目标版本沿 supersedes / retained_from 边向全部祖先展开
+    去重 DAG。节点为版本视图并附到目标的最短距离，边附 relation；
+    历史行无出边时视为根。血缘存在环或悬空边时返回 409 LINEAGE_CORRUPT。"""
+    try:
+        result = logic.get_lineage(rate_id)
+    except logic.RateNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "RATE_NOT_FOUND", "message": str(exc)},
+        )
+    except logic.LineageCorruptError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "LINEAGE_CORRUPT", "message": str(exc)},
+        )
+    return LineageResponse(
+        target_rate_id=result["target_id"],
+        nodes=[
+            LineageNode(**to_view(row).model_dump(), distance=result["distances"][row["id"]])
+            for row in result["nodes"]
+        ],
+        edges=[LineageEdge(**edge) for edge in result["edges"]],
+    )
 
 
 @app.get("/contracts/{contract_no}/coverage", response_model=CoverageResponse)

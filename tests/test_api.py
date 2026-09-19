@@ -1120,3 +1120,249 @@ def test_changes_missing_or_malformed_params_422(client):
                     after_known_at="2026-02-01T00:00:00Z")
     assert r.status_code == 422
     assert r.json()["code"] == "INVALID_REQUEST"
+
+
+# ---------- 版本血缘 ----------
+
+def get_lineage(client, rate_id):
+    return client.get(f"/rates/{rate_id}/lineage")
+
+
+def test_lineage_initial_version_is_root(client):
+    """首个版本无出边：血缘只有自身节点、无边，视为根。"""
+    post_rate(client, contract_no="L-1", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z", reason="初始费率")
+    r = get_lineage(client, 1)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["target_rate_id"] == 1
+    assert [n["rate_id"] for n in data["nodes"]] == [1]
+    assert data["nodes"][0]["distance"] == 0
+    assert data["nodes"][0]["rate"] == 0.05
+    assert data["nodes"][0]["reason"] == "初始费率"
+    assert data["edges"] == []
+
+
+def test_lineage_full_overlap_supersedes_edge(client):
+    """完整覆盖修订：新版本 → 旧版本一条 supersedes 边。"""
+    post_rate(client, contract_no="L-2", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    post_rate(client, contract_no="L-2", rate=0.08,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-06-01T00:00:00Z", reason="费率更正")
+    data = get_lineage(client, 2).json()
+    assert [(n["rate_id"], n["distance"]) for n in data["nodes"]] == [(2, 0), (1, 1)]
+    assert data["nodes"][0]["version"] == 2
+    assert data["nodes"][1]["version"] == 1
+    assert data["edges"] == [{
+        "from_rate_id": 2, "to_rate_id": 1,
+        "relation": "supersedes",
+        "created_at": "2026-06-01T00:00:00.000000+00:00",
+    }]
+
+    # 从旧版本展开：它是根，不包含取代它的新版本（边方向不可逆）
+    old = get_lineage(client, 1).json()
+    assert [n["rate_id"] for n in old["nodes"]] == [1]
+    assert old["edges"] == []
+
+
+def test_lineage_partial_overlap_retained_from_edges(client):
+    """部分重叠修订：新费率 supersedes 旧版本，两个补偿片段各 retained_from 旧版本。"""
+    post_rate(client, contract_no="L-3", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z", reason="原费率")
+    post_rate(client, contract_no="L-3", rate=0.09,
+              valid_from="2026-04-01T00:00:00Z", valid_to="2026-07-01T00:00:00Z",
+              recorded_at="2026-03-01T00:00:00Z", reason="年中调整")
+    data = get_lineage(client, 2).json()
+    # 距离：目标 v2 为 0；v1 由 supersedes 直达，距离 1；
+    # 补偿片段 v3/v4 是目标的…… 注意它们并非新费率的祖先，需从补偿版本展开
+    assert [(n["rate_id"], n["distance"]) for n in data["nodes"]] == [(2, 0), (1, 1)]
+    assert [(e["from_rate_id"], e["to_rate_id"], e["relation"]) for e in data["edges"]] == [
+        (2, 1, "supersedes"),
+    ]
+
+    # 从左补偿片段（id=3, v3）展开：一条 retained_from 边指向来源旧版本
+    left = get_lineage(client, 3).json()
+    assert [(n["rate_id"], n["distance"]) for n in left["nodes"]] == [(3, 0), (1, 1)]
+    assert left["edges"] == [{
+        "from_rate_id": 3, "to_rate_id": 1, "relation": "retained_from",
+        "created_at": "2026-03-01T00:00:00.000000+00:00",
+    }]
+
+    # 从右补偿片段（id=4, v4）展开同理
+    right = get_lineage(client, 4).json()
+    assert [(n["rate_id"], n["distance"]) for n in right["nodes"]] == [(4, 0), (1, 1)]
+    assert [(e["from_rate_id"], e["to_rate_id"], e["relation"])
+            for e in right["edges"]] == [(4, 1, "retained_from")]
+
+
+def test_lineage_multi_generation_chain_and_distance(client):
+    """连续修订形成祖先链：distance 为到目标的最短边数，节点按距离、版本号排序。"""
+    post_rate(client, contract_no="L-4", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    post_rate(client, contract_no="L-4", rate=0.06,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-02-01T00:00:00Z")
+    post_rate(client, contract_no="L-4", rate=0.07,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-03-01T00:00:00Z")
+    data = get_lineage(client, 3).json()
+    assert [(n["rate_id"], n["version"], n["distance"]) for n in data["nodes"]] == [
+        (3, 3, 0), (2, 2, 1), (1, 1, 2),
+    ]
+    assert [(e["from_rate_id"], e["to_rate_id"], e["relation"]) for e in data["edges"]] == [
+        (3, 2, "supersedes"), (2, 1, "supersedes"),
+    ]
+
+
+def test_lineage_diamond_dedup_and_shortest_distance(client):
+    """补偿片段链与取代链汇合到同一祖先：节点去重、distance 取最短边数。
+
+    v1 全年 0.05；修订一在中间开窗（v2 新费率，v3/v4 补偿，均指向 v1）；
+    修订二完整覆盖（v5 取代当前的 v2/v3/v4）。v5 → v3 → v1 长 2 跳，
+    但 v5 → v1 也经 v2、v4 为 2 跳；再追加修订三后同距离按 version 排序。
+    """
+    post_rate(client, contract_no="L-5", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    post_rate(client, contract_no="L-5", rate=0.09,
+              valid_from="2026-04-01T00:00:00Z", valid_to="2026-07-01T00:00:00Z",
+              recorded_at="2026-03-01T00:00:00Z")
+    post_rate(client, contract_no="L-5", rate=0.11,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-05-01T00:00:00Z")
+    data = get_lineage(client, 5).json()
+    # v5(id=5,d=0)；直接父代 v2/v3/v4 距离 1；v1 经由任一父代再一跳 → 距离 2
+    assert [(n["rate_id"], n["distance"]) for n in data["nodes"]] == [
+        (5, 0), (2, 1), (3, 1), (4, 1), (1, 2),
+    ]
+    rels = {(e["from_rate_id"], e["to_rate_id"], e["relation"]) for e in data["edges"]}
+    assert rels == {
+        (5, 2, "supersedes"), (5, 3, "supersedes"), (5, 4, "supersedes"),
+        (2, 1, "supersedes"), (3, 1, "retained_from"), (4, 1, "retained_from"),
+    }
+    # 节点 v1 只出现一次（去重 DAG）
+    assert [n["rate_id"] for n in data["nodes"]].count(1) == 1
+    # 边按源距离排序：先 v5 出发（源 d=0），再 v2/v3/v4 出发（源 d=1，按 id、relation）
+    assert [(e["from_rate_id"], e["relation"], e["to_rate_id"]) for e in data["edges"]] == [
+        (5, "supersedes", 2), (5, "supersedes", 3), (5, "supersedes", 4),
+        (2, "supersedes", 1), (3, "retained_from", 1), (4, "retained_from", 1),
+    ]
+
+
+def test_lineage_retained_chain_keeps_original_reason(client):
+    """多次窗口修订：补偿片段沿 retained_from 链追溯到最初版本。"""
+    post_rate(client, contract_no="L-6", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z", reason="最初费率")
+    # 第一次开窗：左补偿 v3=[01,04)、右补偿 v4=[07,次年01)，均来自 v1
+    post_rate(client, contract_no="L-6", rate=0.09,
+              valid_from="2026-04-01T00:00:00Z", valid_to="2026-07-01T00:00:00Z",
+              recorded_at="2026-03-01T00:00:00Z")
+    # 第二次只压住左补偿 v3 的右半：v5 新费率，v6=[01,02) 为 v3 的补偿（retained_from v3）
+    post_rate(client, contract_no="L-6", rate=0.10,
+              valid_from="2026-02-01T00:00:00Z", valid_to="2026-04-01T00:00:00Z",
+              recorded_at="2026-04-01T00:00:00Z")
+    data = get_lineage(client, 6).json()
+    assert [(n["rate_id"], n["version"], n["distance"]) for n in data["nodes"]] == [
+        (6, 6, 0), (3, 3, 1), (1, 1, 2),
+    ]
+    assert [(e["from_rate_id"], e["to_rate_id"], e["relation"]) for e in data["edges"]] == [
+        (6, 3, "retained_from"), (3, 1, "retained_from"),
+    ]
+    # 血缘节点含现有版本字段：补偿链上 reason 始终来自最初版本
+    assert {n["rate_id"]: n["reason"] for n in data["nodes"]} == {
+        6: "最初费率", 3: "最初费率", 1: "最初费率",
+    }
+
+
+def test_lineage_target_not_found_404(client):
+    r = get_lineage(client, 9999)
+    assert r.status_code == 404
+    assert r.json()["detail"]["code"] == "RATE_NOT_FOUND"
+
+
+def test_lineage_cycle_returns_409_and_does_not_hang(client):
+    """注入自环脏边：返回 409 LINEAGE_CORRUPT，且迭代式展开不会无限递归/挂死。"""
+    post_rate(client, contract_no="L-7", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    post_rate(client, contract_no="L-7", rate=0.08,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-02-01T00:00:00Z")
+    db = os.environ["DATABASE_PATH"]
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT INTO rate_version_edges "
+            "(from_rate_id, to_rate_id, relation, created_at) "
+            "VALUES (1, 1, 'supersedes', '2026-03-01T00:00:00.000000+00:00')"
+        )
+    # 从 v2 展开会沿 supersedes 到达 v1，再踩到回边
+    r = get_lineage(client, 2)
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "LINEAGE_CORRUPT"
+
+
+def test_lineage_dangling_edge_returns_409(client):
+    """注入指向不存在版本的悬空边：返回 409 LINEAGE_CORRUPT。"""
+    post_rate(client, contract_no="L-8", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    db = os.environ["DATABASE_PATH"]
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT INTO rate_version_edges "
+            "(from_rate_id, to_rate_id, relation, created_at) "
+            "VALUES (1, 4242, 'supersedes', '2026-02-01T00:00:00.000000+00:00')"
+        )
+    r = get_lineage(client, 1)
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "LINEAGE_CORRUPT"
+
+
+def test_lineage_history_without_edges_table_rows_is_root(client):
+    """历史行（直接注入、无任何血缘边）展开时视为根，不报错。"""
+    db = os.environ["DATABASE_PATH"]
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT INTO rate_versions "
+            "(contract_no, rate, valid_from, valid_to, recorded_at, version) "
+            "VALUES ('L-9', 0.05, '2026-01-01T00:00:00.000000+00:00', "
+            "        '2027-01-01T00:00:00.000000+00:00', "
+            "        '2026-01-01T00:00:00.000000+00:00', 1)"
+        )
+    r = get_lineage(client, 1)
+    assert r.status_code == 200
+    data = r.json()
+    assert [(n["rate_id"], n["distance"]) for n in data["nodes"]] == [(1, 0)]
+    assert data["edges"] == []
+
+
+def test_lineage_edges_written_transactionally_with_revision(client):
+    """同一修订中 supersedes / retained_from 边与版本行同时存在（直接核对边表）。"""
+    post_rate(client, contract_no="L-10", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    post_rate(client, contract_no="L-10", rate=0.09,
+              valid_from="2026-04-01T00:00:00Z", valid_to="2026-07-01T00:00:00Z",
+              recorded_at="2026-03-01T00:00:00Z")
+    db = os.environ["DATABASE_PATH"]
+    with sqlite3.connect(db) as conn:
+        rows = conn.execute(
+            "SELECT from_rate_id, to_rate_id, relation FROM rate_version_edges "
+            "ORDER BY id ASC"
+        ).fetchall()
+    assert rows == [(2, 1, "supersedes"), (3, 1, "retained_from"), (4, 1, "retained_from")]
+    # (from, to, relation) 唯一：重复写入被数据库拒绝
+    with pytest.raises(sqlite3.IntegrityError):
+        with sqlite3.connect(db) as conn:
+            conn.execute(
+                "INSERT INTO rate_version_edges "
+                "(from_rate_id, to_rate_id, relation, created_at) "
+                "VALUES (2, 1, 'supersedes', '2026-03-01T00:00:00.000000+00:00')"
+            )
+
