@@ -6,10 +6,15 @@
 
 修订 = 追加新版本并把被覆盖旧版本的交集标记 superseded_at，交集之外的左、右
 部分按原费率与 reason 追加补偿版本；历史行永不修改、永不删除。
+
+版本血缘（rate_version_edges）随修订在同一事务写入：新费率对每个被取代版本建立
+supersedes 边，补偿片段对其来源旧版本建立 retained_from 边；边方向为
+后继版本 -> 祖先版本，没有出边的版本视为血缘根。
 """
 
 import math
 import sqlite3
+from collections import deque
 from datetime import datetime
 from typing import Optional
 
@@ -40,6 +45,14 @@ class InvalidKnownAtOrderError(ValueError):
     """before_known_at 不早于 after_known_at，认知时点顺序非法。"""
 
 
+class RateNotFoundError(LookupError):
+    """指定 rate_id 的版本不存在。"""
+
+
+class LineageCorruptError(ValueError):
+    """血缘图损坏：存在环（不再是 DAG）或悬空边（祖先版本不存在）。"""
+
+
 def record_rate(
     contract_no: str,
     rate: float,
@@ -58,7 +71,9 @@ def record_rate(
     不会产生 gap。
 
     取代标记、新版本、补偿版本在同一事务内完成；版本号严格递增，新版本在前，
-    补偿片段按 valid_from 排序（同点按被覆盖版本的原始顺序）在后。
+    补偿片段按 valid_from 排序（同点按被覆盖版本的原始顺序）在后。血缘边也在
+    同一事务写入：新版本对每个被取代版本建 supersedes 边，每个补偿片段对其
+    来源旧版本建 retained_from 边。
 
     返回 (新版本行, 被取代的版本 id 列表, 补偿版本行列表)。
     """
@@ -132,11 +147,19 @@ def record_rate(
                     old["reason"],
                 ),
             )
+            retained_id = piece_cursor.lastrowid
             retained_rows.append(
                 conn.execute(
                     "SELECT * FROM rate_versions WHERE id = ?",
-                    (piece_cursor.lastrowid,),
+                    (retained_id,),
                 ).fetchone()
+            )
+            # 补偿片段 -> 切出它的来源旧版本（retained_from）
+            conn.execute(
+                "INSERT INTO rate_version_edges "
+                "(from_rate_id, to_rate_id, relation, recorded_at) "
+                "VALUES (?, ?, 'retained_from', ?)",
+                (retained_id, old["id"], ra),
             )
 
         # 取代标记与新增行在同一事务提交，任一失败整体回滚。
@@ -145,6 +168,13 @@ def record_rate(
             conn.execute(
                 "UPDATE rate_versions SET superseded_at = ? WHERE id = ?",
                 (ra, version_id),
+            )
+            # 新费率 -> 本次被取代的每个旧版本（supersedes）
+            conn.execute(
+                "INSERT INTO rate_version_edges "
+                "(from_rate_id, to_rate_id, relation, recorded_at) "
+                "VALUES (?, ?, 'supersedes', ?)",
+                (new_row["id"], version_id, ra),
             )
 
         if own_conn:
@@ -190,6 +220,109 @@ def get_timeline(contract_no: str) -> list[sqlite3.Row]:
             (contract_no,),
         ).fetchall()
     return list(rows)
+
+
+def get_lineage(rate_id: int) -> dict:
+    """从目标版本出发、沿血缘边（后继 -> 祖先）展开到全部祖先的去重 DAG。
+
+    遍历为带访问标记的迭代式 BFS（按层推进，天然按最短路径给出各节点到目标的
+    距离），DAG 内节点只出现一次；即使血缘图里被注入环也不会无限递归。展开
+    完成后以 Kahn 拓扑排序校验是否存在环，并校验所有边的祖先版本真实存在
+    （悬空边）；发现任一异常抛出 LineageCorruptError。目标版本不存在时抛出
+    RateNotFoundError。
+
+    节点按 (距目标的距离升序, version 升序, id 升序) 排序；边按
+    (源节点距离, 目标节点距离, from_rate_id, to_rate_id, relation) 稳定排序。
+    返回 {"target_id", "nodes": [Row], "edges": [dict]}。
+    """
+    with connect() as conn:
+        target = conn.execute(
+            "SELECT * FROM rate_versions WHERE id = ?", (rate_id,)
+        ).fetchone()
+        if target is None:
+            raise RateNotFoundError(f"费率版本 id={rate_id} 不存在")
+
+        # 迭代式 BFS：visited 保证每个版本只展开一次，遇环也会终止。
+        distances: dict[int, int] = {rate_id: 0}
+        nodes_by_id: dict[int, sqlite3.Row] = {rate_id: target}
+        edges: list[dict] = []
+        frontier = [rate_id]
+        distance = 0
+        while frontier:
+            placeholders = ",".join("?" for _ in frontier)
+            found_edges = conn.execute(
+                f"SELECT from_rate_id, to_rate_id, relation FROM rate_version_edges "
+                f"WHERE from_rate_id IN ({placeholders})",
+                frontier,
+            ).fetchall()
+            next_frontier: list[int] = []
+            for e in found_edges:
+                edges.append(
+                    {"from_rate_id": e["from_rate_id"],
+                     "to_rate_id": e["to_rate_id"], "relation": e["relation"]}
+                )
+                parent_id = e["to_rate_id"]
+                if parent_id not in distances:
+                    distances[parent_id] = distance + 1
+                    next_frontier.append(parent_id)
+            # 一次性取本层新发现的祖先版本
+            if next_frontier:
+                placeholders = ",".join("?" for _ in next_frontier)
+                rows = conn.execute(
+                    f"SELECT * FROM rate_versions WHERE id IN ({placeholders})",
+                    next_frontier,
+                ).fetchall()
+                found_ids = set()
+                for row in rows:
+                    nodes_by_id[row["id"]] = row
+                    found_ids.add(row["id"])
+                missing = [rid for rid in next_frontier if rid not in found_ids]
+                if missing:
+                    raise LineageCorruptError(
+                        f"血缘存在悬空边：祖先版本 {sorted(missing)} 不存在"
+                    )
+            frontier = next_frontier
+            distance += 1
+
+        # Kahn 拓扑排序校验环：边方向为后继 -> 祖先，入度为 0 的点即最远祖先。
+        # 去重后的边集（UNIQUE 约束已保证不重复，这里再防御一次）。
+        unique_edges = {
+            (e["from_rate_id"], e["to_rate_id"], e["relation"]): e for e in edges
+        }.values()
+        indegree: dict[int, int] = {rid: 0 for rid in nodes_by_id}
+        children: dict[int, list[int]] = {rid: [] for rid in nodes_by_id}
+        for e in unique_edges:
+            indegree[e["to_rate_id"]] += 1
+            children[e["from_rate_id"]].append(e["to_rate_id"])
+        queue = deque(rid for rid, deg in indegree.items() if deg == 0)
+        topo_count = 0
+        while queue:
+            node = queue.popleft()
+            topo_count += 1
+            for parent in children[node]:
+                indegree[parent] -= 1
+                if indegree[parent] == 0:
+                    queue.append(parent)
+        if topo_count != len(nodes_by_id):
+            raise LineageCorruptError(
+                f"血缘存在环：从版本 id={rate_id} 展开的版本图不是 DAG"
+            )
+
+    nodes = sorted(
+        nodes_by_id.values(),
+        key=lambda row: (distances[row["id"]], row["version"], row["id"]),
+    )
+    sorted_edges = sorted(
+        {(e["from_rate_id"], e["to_rate_id"], e["relation"]): e for e in edges}.values(),
+        key=lambda e: (
+            distances[e["from_rate_id"]],
+            distances[e["to_rate_id"]],
+            e["from_rate_id"],
+            e["to_rate_id"],
+            e["relation"],
+        ),
+    )
+    return {"target_id": rate_id, "nodes": nodes, "edges": sorted_edges}
 
 
 def _visible_clipped(

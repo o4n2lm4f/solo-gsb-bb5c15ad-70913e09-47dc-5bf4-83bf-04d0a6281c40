@@ -24,8 +24,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="合同费率双时态追溯 API",
-    version="1.3.0",
-    description="按业务时间（valid_at）与认知时间（known_at）双维度追溯合同费率，修订只追加版本、不覆盖历史。",
+    version="1.4.0",
+    description="按业务时间（valid_at）与认知时间（known_at）双维度追溯合同费率，修订只追加版本、不覆盖历史；版本血缘以可审计的 supersedes / retained_from 边记录。",
     lifespan=lifespan,
 )
 
@@ -74,6 +74,20 @@ class QuoteResponse(BaseModel):
 class TimelineResponse(BaseModel):
     contract_no: str
     versions: list[VersionView]
+
+
+class LineageEdge(BaseModel):
+    from_rate_id: int = Field(description="后继版本 id（新费率或补偿片段）")
+    to_rate_id: int = Field(description="祖先版本 id（被取代版本或补偿片段来源版本）")
+    relation: str = Field(description="supersedes（取代）/ retained_from（补偿片段来源）")
+
+
+class LineageResponse(BaseModel):
+    target_rate_id: int
+    nodes: list[VersionView] = Field(
+        description="目标及其全部祖先版本（去重 DAG），按距目标从近到远、version 升序排序"
+    )
+    edges: list[LineageEdge] = Field(description="血缘边（后继 -> 祖先），按端点距离稳定排序")
 
 
 class CoverageSegment(BaseModel):
@@ -291,6 +305,31 @@ def timeline(contract_no: str):
             detail={"code": "CONTRACT_NOT_FOUND", "message": f"合同 '{contract_no}' 无任何费率版本"},
         )
     return TimelineResponse(contract_no=contract_no, versions=[to_view(r) for r in rows])
+
+
+@app.get("/rates/{rate_id}/lineage", response_model=LineageResponse)
+def rate_lineage(rate_id: int):
+    """版本血缘：从目标版本沿 supersedes / retained_from 边向全部祖先展开的去重 DAG。
+    节点含版本全部现有字段，边含 relation；节点按距目标从近到远、版本号稳定排序。
+    没有出边的历史行视为根（单独返回目标节点、无边）。血缘损坏（环或悬空边）
+    返回 409 LINEAGE_CORRUPT。"""
+    try:
+        result = logic.get_lineage(rate_id)
+    except logic.RateNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "RATE_NOT_FOUND", "message": str(exc)},
+        )
+    except logic.LineageCorruptError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "LINEAGE_CORRUPT", "message": str(exc)},
+        )
+    return LineageResponse(
+        target_rate_id=result["target_id"],
+        nodes=[to_view(r) for r in result["nodes"]],
+        edges=[LineageEdge(**e) for e in result["edges"]],
+    )
 
 
 @app.get("/contracts/{contract_no}/coverage", response_model=CoverageResponse)

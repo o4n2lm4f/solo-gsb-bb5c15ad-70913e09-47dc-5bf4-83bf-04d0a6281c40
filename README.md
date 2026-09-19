@@ -47,6 +47,18 @@ docker compose up --build
 取代标记、新版本与补偿版本在**同一事务**提交：先创建新费率（取得最小的新
 版本号），补偿片段再按 `valid_from` 排序紧随其后，`version` 严格递增。
 
+**可审计版本血缘（v1.4 起）**：每次修订还会在**同一事务**向 `rate_version_edges`
+写入血缘边（只追加、不修改），边的方向为**后继版本 → 祖先版本**：
+
+| 边 `relation` | 起点 | 终点 |
+|---|---|---|
+| `supersedes` | 本次新建费率 | 本次被取代的**每个**旧版本 |
+| `retained_from` | 补偿片段（左/右保留版本） | 切出该片段的来源旧版本 |
+
+因此一次部分重叠修订会同时产生 1 条（或多条）`supersedes` 边和每个补偿片段
+各 1 条 `retained_from` 边。**没有任何出边的版本（含功能上线前录入的历史行）
+视为血缘根**，血缘查询对根版本返回单节点、无边。
+
 ## 接口
 
 ### 1. 录入 / 修订费率 — `POST /rates`
@@ -293,6 +305,60 @@ curl "http://localhost:8000/contracts/HT-2026-001/changes?from=2026-01-01T00:00:
 }
 ```
 
+### 7. 版本血缘 — `GET /rates/{rate_id}/lineage`
+
+```bash
+curl http://localhost:8000/rates/2/lineage
+```
+
+从目标版本出发，沿 `supersedes` / `retained_from` 边（后继 → 祖先）向
+**全部祖先**展开，返回去重后的有向无环图（DAG）：同一祖先经多条路径到达
+（例如既被新费率取代、又是某补偿片段的来源）时只出现一次。
+
+- `nodes`：目标版本及其全部祖先版本，节点字段与时间线/报价中的版本字段完全
+  一致（`rate_id`、`rate`、`version`、业务/系统时间区间、`status`、`reason` 等），
+  **按距目标从近到远排序（距离相同时按 `version` 升序）**；目标自身距离为 0。
+- `edges`：展开到的全部血缘边，每条含 `from_rate_id`、`to_rate_id`、`relation`
+  （`supersedes` / `retained_from`），按端点距离与 id 稳定排序。
+- 目标版本没有任何出边时（初始版本或历史行）返回单节点、空边列表。
+
+| 情形 | 状态码 | `code` |
+|---|---|---|
+| 正常展开（含根版本） | 200 | — |
+| `rate_id` 不存在 | 404 | `RATE_NOT_FOUND` |
+| 血缘存在环（不再是 DAG）或悬空边（祖先版本不存在） | 409 | `LINEAGE_CORRUPT` |
+
+遍历使用带访问标记的迭代式广度优先展开 + Kahn 拓扑校验，即使血缘数据被直接
+篡改成带环也**不会无限递归**，而是返回 `409 LINEAGE_CORRUPT`。
+
+响应示例（v2 部分重叠取代 v1 并产生两个补偿版本 v3、v4；查询 `v2` 与 `v3`）：
+
+```json
+// GET /rates/2/lineage
+{
+  "target_rate_id": 2,
+  "nodes": [
+    {"rate_id": 2, "rate": 0.09, "version": 2, "...": "..."},
+    {"rate_id": 1, "rate": 0.05, "version": 1, "status": "superseded", "...": "..."}
+  ],
+  "edges": [
+    {"from_rate_id": 2, "to_rate_id": 1, "relation": "supersedes"}
+  ]
+}
+
+// GET /rates/3/lineage（左补偿片段：1–3 月，保留原费率）
+{
+  "target_rate_id": 3,
+  "nodes": [
+    {"rate_id": 3, "rate": 0.05, "version": 3, "status": "current", "...": "..."},
+    {"rate_id": 1, "rate": 0.05, "version": 1, "status": "superseded", "...": "..."}
+  ],
+  "edges": [
+    {"from_rate_id": 3, "to_rate_id": 1, "relation": "retained_from"}
+  ]
+}
+```
+
 ## 本地开发（不用 Docker）
 
 ```bash
@@ -307,8 +373,8 @@ pytest                 # 运行测试
 ```
 app/
   main.py      FastAPI 路由与请求/响应模型
-  logic.py     双时态核心逻辑（追加式录入、时点查询、时间线、覆盖率分段、计费预览、变更对比）
-  db.py        SQLite 连接与自动建表
+  logic.py     双时态核心逻辑（追加式录入、时点查询、时间线、覆盖率分段、计费预览、变更对比、版本血缘 DAG）
+  db.py        SQLite 连接与自动建表（rate_versions + rate_version_edges 血缘边）
   timeutil.py  UTC 时间规范化（等宽 ISO 字符串，可字典序比较）
 tests/test_api.py
 Dockerfile / docker-compose.yml
